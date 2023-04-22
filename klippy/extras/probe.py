@@ -16,7 +16,6 @@ can travel further (the Z minimum position can be negative).
 class PrinterProbe:
     def __init__(self, config, mcu_probe):
         self.printer = config.get_printer()
-        self.back_tap = self.printer.load_object(config, "back_tap_probe") # Find Back Tap Probe
         self.name = config.get_name()
         self.mcu_probe = mcu_probe
         self.speed = config.getfloat('speed', 5.0, above=0.)
@@ -165,7 +164,6 @@ class PrinterProbe:
         while len(positions) < sample_count:
             # Probe position
             pos = self._probe(speed)
-            pos[2] = self.back_tap.process_deviation(pos) # Calculating Back Tap Probe xz deviation
             positions.append(pos)
             # Check samples tolerance
             z_positions = [p[2] for p in positions]
