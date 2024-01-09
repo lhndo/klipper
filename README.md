@@ -16,3 +16,12 @@ Klipper is Free Software. See the [license](COPYING) or read the
 [documentation](https://www.klipper3d.org/Overview.html). We depend on
 the generous support from our
 [sponsors](https://www.klipper3d.org/Sponsors.html).
+
+
+## Installation
+```
+mv ~/klipper ~/klipper_old
+git clone https://github.com/lhndo/klipper.git ~/klipper
+sudo systemctl restart klipper
+sudo systemctl restart moonraker
+```
