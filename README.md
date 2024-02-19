@@ -1,7 +1,7 @@
 Welcome to the Klipper project!
 
 [![Klipper](docs/img/klipper-logo-small.png)](https://www.klipper3d.org/)
-
+  
 https://www.klipper3d.org/
 
 Klipper is a 3d-Printer firmware. It combines the power of a general
