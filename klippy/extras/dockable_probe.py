@@ -1,297 +1,691 @@
-# Support for probes that dock on the XZ plane, like on bedslingers
+# Dockable Probe
+#   This provides support for probes that are magnetically coupled
+#   to the toolhead and stowed in a dock when not in use and
 #
-# Copyright (C) 2022  Lasse Dalegaard <dalegaard@gmail.com>
+# Copyright (C) 2018-2023  Kevin O'Connor <kevin@koconnor.net>
+# Copyright (C) 2021       Paul McGowan <mental405@gmail.com>
+# Copyright (C) 2023       Alan Smith <alan@airpost.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-#
-# Place in `klippy/extras/` folder as `xz_dockable_probe.py`, then add
-# the following line to your `.git/info/exclude` file:
-# klippy/extras/xz_dockable_probe.py
+from . import probe
+from math import sin, cos, atan2, pi, sqrt
 
-import logging
-from .homing import HomingMove
+PROBE_VERIFY_DELAY = 0.1
+
+PROBE_UNKNOWN = 0
+PROBE_ATTACHED = 1
+PROBE_DOCKED = 2
+
+MULTI_OFF = 0
+MULTI_FIRST = 1
+MULTI_ON = 2
+
+HINT_VERIFICATION_ERROR = """
+{0}: A probe attachment verification method
+was not provided. A method to verify the probes attachment
+state must be specified to prevent unintended behavior.
+
+At least one of the following must be specified:
+'check_open_attach', 'probe_sense_pin', 'dock_sense_pin'
+
+Please see {0}.md and config_Reference.md.
+"""
+
+# Helper class to handle polling pins for probe attachment states
+class PinPollingHelper:
+    def __init__(self, config, endstop):
+        self.printer = config.get_printer()
+        self.query_endstop = endstop
+        self.last_verify_time = 0
+        self.last_verify_state = None
+
+    def query_pin(self, curtime):
+        if (
+            curtime > (self.last_verify_time + PROBE_VERIFY_DELAY)
+            or self.last_verify_state is None
+        ):
+            self.last_verify_time = curtime
+            toolhead = self.printer.lookup_object("toolhead")
+            query_time = toolhead.get_last_move_time()
+            self.last_verify_state = not not self.query_endstop(query_time)
+        return self.last_verify_state
+
+    def query_pin_inv(self, curtime):
+        return not self.query_pin(curtime)
+
+
+# Helper class to verify probe attachment status
+class ProbeState:
+    def __init__(self, config, aProbe):
+        self.printer = config.get_printer()
+
+        if (
+            not config.fileconfig.has_option(
+                config.section, "check_open_attach"
+            )
+            and not config.fileconfig.has_option(
+                config.section, "probe_sense_pin"
+            )
+            and not config.fileconfig.has_option(
+                config.section, "dock_sense_pin"
+            )
+        ):
+            raise self.printer.config_error(
+                HINT_VERIFICATION_ERROR.format(aProbe.name)
+            )
+
+        self.printer.register_event_handler("klippy:ready", self._handle_ready)
+
+        # Configure sense pins as endstops so they
+        # can be polled at specific times
+        ppins = self.printer.lookup_object("pins")
+
+        def configEndstop(pin):
+            pin_params = ppins.lookup_pin(pin, can_invert=True, can_pullup=True)
+            mcu = pin_params["chip"]
+            mcu_endstop = mcu.setup_pin("endstop", pin_params)
+            helper = PinPollingHelper(config, mcu_endstop.query_endstop)
+            return helper
+
+        probe_sense_helper = None
+        dock_sense_helper = None
+
+        # Setup sensor pins, if configured, otherwise use probe endstop
+        # as a dummy sensor.
+        ehelper = PinPollingHelper(config, aProbe.query_endstop)
+
+        # Probe sense pin is optional
+        probe_sense_pin = config.get("probe_sense_pin", None)
+        if probe_sense_pin is not None:
+            probe_sense_helper = configEndstop(probe_sense_pin)
+            self.probe_sense_pin = probe_sense_helper.query_pin
+        else:
+            self.probe_sense_pin = ehelper.query_pin_inv
+
+        # If check_open_attach is specified, it takes precedence
+        # over probe_sense_pin
+        check_open_attach = None
+        if config.fileconfig.has_option(config.section, "check_open_attach"):
+            check_open_attach = config.getboolean("check_open_attach")
+
+            if check_open_attach:
+                self.probe_sense_pin = ehelper.query_pin_inv
+            else:
+                self.probe_sense_pin = ehelper.query_pin
+
+        # Dock sense pin is optional
+        self.dock_sense_pin = None
+        dock_sense_pin = config.get("dock_sense_pin", None)
+        if dock_sense_pin is not None:
+            dock_sense_helper = configEndstop(dock_sense_pin)
+            self.dock_sense_pin = dock_sense_helper.query_pin
+
+    def _handle_ready(self):
+        self.last_verify_time = 0
+        self.last_verify_state = PROBE_UNKNOWN
+
+    def get_probe_state(self):
+        curtime = self.printer.get_reactor().monotonic()
+        return self.get_probe_state_with_time(curtime)
+
+    def get_probe_state_with_time(self, curtime):
+        if (
+            self.last_verify_state == PROBE_UNKNOWN
+            or curtime > self.last_verify_time + PROBE_VERIFY_DELAY
+        ):
+            self.last_verify_time = curtime
+            self.last_verify_state = PROBE_UNKNOWN
+
+            a = self.probe_sense_pin(curtime)
+
+            if self.dock_sense_pin is not None:
+                d = self.dock_sense_pin(curtime)
+
+                if a and not d:
+                    self.last_verify_state = PROBE_ATTACHED
+                elif d and not a:
+                    self.last_verify_state = PROBE_DOCKED
+            else:
+                if a:
+                    self.last_verify_state = PROBE_ATTACHED
+                elif not a:
+                    self.last_verify_state = PROBE_DOCKED
+        return self.last_verify_state
+
 
 class DockableProbe:
     def __init__(self, config):
         self.printer = config.get_printer()
-        self.printer.register_event_handler("klippy:connect",
-            self.handle_connect)
-        self.position_endstop = config.getfloat("position_endstop", 0.0) #adding a position_endstop in case of homing at the top
-        ppins = self.printer.lookup_object('pins')
-        pin = config.get('dock_pin')
+        self.gcode = self.printer.lookup_object("gcode")
+        self.name = config.get_name()
+
+        # Configuration Options
+        self.position_endstop = config.getfloat("z_offset")
+        self.x_offset = config.getfloat("x_offset", 0.0)
+        self.y_offset = config.getfloat("y_offset", 0.0)
+        self.speed = config.getfloat("speed", 5.0, above=0.0)
+        self.lift_speed = config.getfloat("lift_speed", self.speed, above=0.0)
+        self.dock_retries = config.getint("dock_retries", 0)
+        self.auto_attach_detach = config.getboolean("auto_attach_detach", True)
+        self.travel_speed = config.getfloat(
+            "travel_speed", self.speed, above=0.0
+        )
+        self.attach_speed = config.getfloat(
+            "attach_speed", self.travel_speed, above=0.0
+        )
+        self.detach_speed = config.getfloat(
+            "detach_speed", self.travel_speed, above=0.0
+        )
+        self.sample_retract_dist = config.getfloat(
+            "sample_retract_dist", 2.0, above=0.0
+        )
+
+        # Positions (approach, detach, etc)
+        self.approach_position = self._parse_coord(config, "approach_position")
+        self.detach_position = self._parse_coord(config, "detach_position")
+        self.dock_position = self._parse_coord(config, "dock_position")
+        self.z_hop = config.getfloat("z_hop", 0.0, above=0.0)
+
+        self.dock_requires_z = (
+            self.approach_position[2] is not None
+            or self.dock_position[2] is not None
+        )
+
+        self.dock_angle, self.approach_distance = self._get_vector(
+            self.dock_position, self.approach_position
+        )
+        self.detach_angle, self.detach_distance = self._get_vector(
+            self.dock_position, self.detach_position
+        )
+
+        # Pins
+        ppins = self.printer.lookup_object("pins")
+        pin = config.get("pin")
         pin_params = ppins.lookup_pin(pin, can_invert=True, can_pullup=True)
-        mcu = pin_params['chip']
+        mcu = pin_params["chip"]
         mcu.register_config_callback(self._build_config)
-        self.mcu_endstop = mcu.setup_pin('endstop', pin_params)
-        query_endstops = self.printer.load_object(config, 'query_endstops')
-        query_endstops.register_endstop(self.mcu_endstop, 'probe_dock')
-        self.printer.lookup_object('pins').register_chip('probe_dock', self)
+        self.mcu_endstop = mcu.setup_pin("endstop", pin_params)
 
-        self.printer.load_object(config, 'homing')
+        # Wrappers
+        self.get_mcu = self.mcu_endstop.get_mcu
+        self.add_stepper = self.mcu_endstop.add_stepper
+        self.get_steppers = self.mcu_endstop.get_steppers
+        self.home_wait = self.mcu_endstop.home_wait
+        self.query_endstop = self.mcu_endstop.query_endstop
+        self.finish_home_complete = self.wait_trigger_complete = None
 
-        self.gcode = self.printer.lookup_object('gcode')
-        self.gcode.register_command('PROBE_ATTACH', self.cmd_PROBE_ATTACH,
-                                    desc=self.cmd_PROBE_ATTACH_help)
-        self.gcode.register_command('PROBE_DETACH', self.cmd_PROBE_DETACH,
-                                    desc=self.cmd_PROBE_DETACH_help)
-        self.gcode.register_command('PROBE_LOCK', self.cmd_PROBE_LOCK,
-                                    desc=self.cmd_PROBE_LOCK_help)
-        self.gcode.register_command('PROBE_UNLOCK', self.cmd_PROBE_UNLOCK,
-                                    desc=self.cmd_PROBE_UNLOCK_help)
-        self.gcode.register_command('PROBE_STATE', self.cmd_PROBE_STATE,
-                                    desc=self.cmd_PROBE_STATE_help)
-        self.gcode.register_command('G28', None)
-        self.gcode.register_command('G28', self.cmd_G28,
-                                    desc=self.cmd_G28_help)
+        # State
+        self.last_z = -9999
+        self.multi = MULTI_OFF
+        self._last_homed = None
 
-        self.dock_x = config.getint('dock_x')
-        self.park_dx = config.getint('park_delta_x')
-        self.detach_dx = config.getint('detach_delta_x')
-        self.z_hop = config.getint('z_hop', minval=0)
-        self.attachment_check_hop = config.get('attachment_check_hop', 5)
-        self.z_speed = config.getint('z_speed', 30)
-        self.xy_speed = config.getint('xy_speed', 70)
-        self.hook_commands = config.getboolean('hook_commands', True)
+        pstate = ProbeState(config, self)
+        self.get_probe_state = pstate.get_probe_state
+        self.last_probe_state = PROBE_UNKNOWN
 
+        self.probe_states = {
+            PROBE_ATTACHED: "ATTACHED",
+            PROBE_DOCKED: "DOCKED",
+            PROBE_UNKNOWN: "UNKNOWN",
+        }
+
+        # Gcode Commands
+        self.gcode.register_command(
+            "QUERY_DOCKABLE_PROBE",
+            self.cmd_QUERY_DOCKABLE_PROBE,
+            desc=self.cmd_QUERY_DOCKABLE_PROBE_help,
+        )
+
+        self.gcode.register_command(
+            "MOVE_TO_APPROACH_PROBE",
+            self.cmd_MOVE_TO_APPROACH_PROBE,
+            desc=self.cmd_MOVE_TO_APPROACH_PROBE_help,
+        )
+        self.gcode.register_command(
+            "MOVE_TO_DOCK_PROBE",
+            self.cmd_MOVE_TO_DOCK_PROBE,
+            desc=self.cmd_MOVE_TO_DOCK_PROBE_help,
+        )
+        self.gcode.register_command(
+            "MOVE_TO_EXTRACT_PROBE",
+            self.cmd_MOVE_TO_EXTRACT_PROBE,
+            desc=self.cmd_MOVE_TO_EXTRACT_PROBE_help,
+        )
+        self.gcode.register_command(
+            "MOVE_TO_INSERT_PROBE",
+            self.cmd_MOVE_TO_INSERT_PROBE,
+            desc=self.cmd_MOVE_TO_INSERT_PROBE_help,
+        )
+        self.gcode.register_command(
+            "MOVE_TO_DETACH_PROBE",
+            self.cmd_MOVE_TO_DETACH_PROBE,
+            desc=self.cmd_MOVE_TO_DETACH_PROBE_help,
+        )
+
+        self.gcode.register_command(
+            "SET_DOCKABLE_PROBE",
+            self.cmd_SET_DOCKABLE_PROBE,
+            desc=self.cmd_SET_DOCKABLE_PROBE_help,
+        )
+        self.gcode.register_command(
+            "ATTACH_PROBE",
+            self.cmd_ATTACH_PROBE,
+            desc=self.cmd_ATTACH_PROBE_help,
+        )
+        self.gcode.register_command(
+            "DETACH_PROBE",
+            self.cmd_DETACH_PROBE,
+            desc=self.cmd_DETACH_PROBE_help,
+        )
+
+        # Event Handlers
+        self.printer.register_event_handler(
+            "klippy:connect", self._handle_connect
+        )
+
+    # Parse a string coordinate representation from the config
+    # and return a list of numbers.
+    #
+    # e.g. "233, 10, 0" -> [233, 10, 0]
+    def _parse_coord(self, config, name, expected_dims=3):
+        val = config.get(name)
+        error_msg = "Unable to parse {0} in {1}: {2}"
+        if not val:
+            return None
         try:
-            x_pos, y_pos = config.get("home_xy_position").split(',')
-            self.home_x_pos, self.home_y_pos = float(x_pos), float(y_pos)
-        except:
-            raise config.error("Unable to parse home_xy_position in %s"
-                               % (config.get_name(),))
+            vals = [float(x.strip()) for x in val.split(",")]
+        except Exception as e:
+            raise config.error(error_msg.format(name, self.name, str(e)))
+        supplied_dims = len(vals)
+        if not 2 <= supplied_dims <= expected_dims:
+            raise config.error(
+                error_msg.format(
+                    name, self.name, "Invalid number of coordinates"
+                )
+            )
+        p = [None] * 3
+        p[:supplied_dims] = vals
+        return p
 
-        self.locked = False
+    def _build_config(self):
+        kin = self.printer.lookup_object("toolhead").get_kinematics()
+        for stepper in kin.get_steppers():
+            if stepper.is_active_axis("z"):
+                self.add_stepper(stepper)
 
+    def _handle_connect(self):
+        self.toolhead = self.printer.lookup_object("toolhead")
+
+    #######################################################################
+    # GCode Commands
+    #######################################################################
+
+    cmd_QUERY_DOCKABLE_PROBE_help = (
+        "Prints the current probe state,"
+        + " valid probe states are UNKNOWN, ATTACHED, and DOCKED"
+    )
+
+    def cmd_QUERY_DOCKABLE_PROBE(self, gcmd):
+        self.last_probe_state = self.get_probe_state()
+        state = self.probe_states[self.last_probe_state]
+
+        gcmd.respond_info("Probe Status: %s" % (state))
+
+    def get_status(self, curtime):
+        # Use last_'status' here to be consistent with QUERY_PROBE_'STATUS'.
+        return {
+            "last_status": self.last_probe_state,
+        }
+
+    cmd_MOVE_TO_APPROACH_PROBE_help = (
+        "Move close to the probe dock" "before attaching"
+    )
+
+    def cmd_MOVE_TO_APPROACH_PROBE(self, gcmd):
+        self._align_z()
+
+        if self._check_distance(dist=self.approach_distance):
+            self._align_to_vector(self.dock_angle)
+        else:
+            self._move_to_vector(self.dock_angle)
+
+        if len(self.approach_position) > 2:
+            self.toolhead.manual_move(
+                [None, None, self.approach_position[2]], self.travel_speed
+            )
+
+        self.toolhead.manual_move(
+            [self.approach_position[0], self.approach_position[1], None],
+            self.travel_speed,
+        )
+
+    cmd_MOVE_TO_DOCK_PROBE_help = (
+        "Move to connect the toolhead/dock" "to the probe"
+    )
+
+    def cmd_MOVE_TO_DOCK_PROBE(self, gcmd):
+        if len(self.dock_position) > 2:
+            self.toolhead.manual_move(
+                [None, None, self.dock_position[2]], self.attach_speed
+            )
+
+        self.toolhead.manual_move(
+            [self.dock_position[0], self.dock_position[1], None],
+            self.attach_speed,
+        )
+
+    cmd_MOVE_TO_EXTRACT_PROBE_help = (
+        "Move away from the dock with the" "probe attached"
+    )
+
+    def cmd_MOVE_TO_EXTRACT_PROBE(self, gcmd):
+        self.cmd_MOVE_TO_APPROACH_PROBE(gcmd)
+
+    cmd_MOVE_TO_INSERT_PROBE_help = (
+        "Move near the dock with the" "probe attached before detaching"
+    )
+
+    def cmd_MOVE_TO_INSERT_PROBE(self, gcmd):
+        self.cmd_MOVE_TO_APPROACH_PROBE(gcmd)
+
+    cmd_MOVE_TO_DETACH_PROBE_help = (
+        "Move away from the dock to detach" "the probe"
+    )
+
+    def cmd_MOVE_TO_DETACH_PROBE(self, gcmd):
+        if len(self.detach_position) > 2:
+            self.toolhead.manual_move(
+                [None, None, self.detach_position[2]], self.detach_speed
+            )
+
+        self.toolhead.manual_move(
+            [self.detach_position[0], self.detach_position[1], None],
+            self.detach_speed,
+        )
+
+    cmd_SET_DOCKABLE_PROBE_help = "Set probe parameters"
+
+    def cmd_SET_DOCKABLE_PROBE(self, gcmd):
+        auto = gcmd.get("AUTO_ATTACH_DETACH", None)
+        if auto is None:
+            return
+
+        if int(auto) == 1:
+            self.auto_attach_detach = True
+        else:
+            self.auto_attach_detach = False
+
+    cmd_ATTACH_PROBE_help = (
+        "Check probe status and attach probe using" "the movement gcodes"
+    )
+
+    def cmd_ATTACH_PROBE(self, gcmd):
+        return_pos = self.toolhead.get_position()
+        self.attach_probe(return_pos)
+
+    cmd_DETACH_PROBE_help = (
+        "Check probe status and detach probe using" "the movement gcodes"
+    )
+
+    def cmd_DETACH_PROBE(self, gcmd):
+        return_pos = self.toolhead.get_position()
+        self.detach_probe(return_pos)
+
+    def attach_probe(self, return_pos=None):
+        retry = 0
+        while (
+            self.get_probe_state() != PROBE_ATTACHED
+            and retry < self.dock_retries + 1
+        ):
+            if self.get_probe_state() != PROBE_DOCKED:
+                raise self.printer.command_error(
+                    "Attach Probe: Probe not detected in dock, aborting"
+                )
+            # Call these gcodes as a script because we don't have enough
+            # structs/data to call the cmd_...() funcs and supply 'gcmd'.
+            # This method also has the advantage of calling user-written gcodes
+            # if they've been defined.
+            self.gcode.run_script_from_command(
+                """
+                MOVE_TO_APPROACH_PROBE
+                MOVE_TO_DOCK_PROBE
+                MOVE_TO_EXTRACT_PROBE
+            """
+            )
+
+            retry += 1
+
+        if self.get_probe_state() != PROBE_ATTACHED:
+            raise self.printer.command_error("Probe attach failed!")
+
+        if return_pos:
+            if not self._check_distance(return_pos, self.approach_distance):
+                self.toolhead.manual_move(
+                    [return_pos[0], return_pos[1], None], self.travel_speed
+                )
+                # Do NOT return to the original Z position after attach
+                # as the probe might crash into the bed.
+
+    def detach_probe(self, return_pos=None):
+        retry = 0
+        while (
+            self.get_probe_state() != PROBE_DOCKED
+            and retry < self.dock_retries + 1
+        ):
+            # Call these gcodes as a script because we don't have enough
+            # structs/data to call the cmd_...() funcs and supply 'gcmd'.
+            # This method also has the advantage of calling user-written gcodes
+            # if they've been defined.
+            self.gcode.run_script_from_command(
+                """
+                MOVE_TO_INSERT_PROBE
+                MOVE_TO_DOCK_PROBE
+                MOVE_TO_DETACH_PROBE
+            """
+            )
+
+            retry += 1
+
+        if self.get_probe_state() != PROBE_DOCKED:
+            raise self.printer.command_error("Probe detach failed!")
+
+        if return_pos:
+            if not self._check_distance(return_pos, self.detach_distance):
+                self.toolhead.manual_move(
+                    [return_pos[0], return_pos[1], None], self.travel_speed
+                )
+                # Return to original Z position after detach as
+                # there's no chance of the probe crashing into the bed.
+                self.toolhead.manual_move(
+                    [None, None, return_pos[2]], self.travel_speed
+                )
+
+    def auto_detach_probe(self, return_pos=None):
+        if self.get_probe_state() == PROBE_DOCKED:
+            return
+        if self.auto_attach_detach:
+            self.detach_probe(return_pos)
+
+    def auto_attach_probe(self, return_pos=None):
+        if self.get_probe_state() == PROBE_ATTACHED:
+            return
+        if not self.auto_attach_detach:
+            raise self.printer.command_error(
+                "Cannot probe, probe is not "
+                "attached and auto-attach is disabled"
+            )
+        self.attach_probe(return_pos)
+
+    #######################################################################
+    # Functions for calculating points and moving the toolhead
+    #######################################################################
+
+    # Move the toolhead to minimum safe distance aligned with angle
+    def _move_to_vector(self, angle):
+        x, y = self._get_point_on_vector(
+            self.dock_position[:2], angle, self.approach_distance
+        )
+        self.toolhead.manual_move([x, y, None], self.travel_speed)
+
+    # Move the toolhead to angle within minimium safe distance
+    def _align_to_vector(self, angle):
+        approach = self._get_intercept(
+            self.toolhead.get_position(),
+            angle + (pi / 2),
+            self.dock_position,
+            angle,
+        )
+        self.toolhead.manual_move(
+            [approach[0], approach[1], None], self.attach_speed
+        )
+
+    # Determine toolhead distance to dock coordinates
+    def _check_distance(self, pos=None, dist=None):
+        if not pos:
+            pos = self.toolhead.get_position()
+        dock = self.dock_position
+
+        if dist > sqrt((pos[0] - dock[0]) ** 2 + (pos[1] - dock[1]) ** 2):
+            return True
+        else:
+            return False
+
+    # Find a point on a vector line at a specific distance
+    def _get_point_on_vector(self, point, angle, magnitude=1):
+        x = point[0] - magnitude * cos(angle)
+        y = point[1] - magnitude * sin(angle)
+        return (x, y)
+
+    # Locate the intersection of two vectors
+    def _get_intercept(self, point1, angle1, point2, angle2):
+        x1, y1 = point1[:2]
+        x2, y2 = self._get_point_on_vector(point1, angle1, 10.0)
+        x3, y3 = point2[:2]
+        x4, y4 = self._get_point_on_vector(point2, angle2, 10.0)
+        det1 = (x1 * y2) - (y1 * x2)
+        det2 = (x3 * y4) - (y3 * x4)
+        d = ((x1 - x2) * (y3 - y4)) - ((y1 - y2) * (x3 - x4))
+        x = float((det1 * (x3 - x4)) - ((x1 - x2) * det2)) / d
+        y = float((det1 * (y3 - y4)) - ((y1 - y2) * det2)) / d
+        return (x, y)
+
+    # Determine the vector of two points
+    def _get_vector(self, point1, point2):
+        x1, y1 = point1[:2]
+        x2, y2 = point2[:2]
+        magnitude = sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+        angle = atan2(y2 - y1, x2 - x1) + pi
+
+        return angle, magnitude
+
+    # Align z axis to prevent crashes
+    def _align_z(self):
+        if not self._last_homed:
+            curtime = self.printer.get_reactor().monotonic()
+            homed_axes = self.toolhead.get_status(curtime)["homed_axes"]
+            self._last_homed = homed_axes
+
+        if self.dock_requires_z:
+            self._align_z_required()
+
+        if self.z_hop > 0.0:
+            if "z" in self._last_homed:
+                tpos = self.toolhead.get_position()
+                if tpos[2] < self.z_hop:
+                    self.toolhead.manual_move(
+                        [None, None, self.z_hop], self.lift_speed
+                    )
+            else:
+                self._force_z_hop()
+
+    def _align_z_required(self):
+        if "z" not in self._last_homed:
+            raise self.printer.command_error(
+                "Cannot attach/detach probe, must home Z axis first"
+            )
+
+        self.toolhead.manual_move(
+            [None, None, self.approach_position[2]], self.lift_speed
+        )
+
+    # Hop z and return to un-homed state
+    def _force_z_hop(self):
+        this_z = self.toolhead.get_position()[2]
+        if self.last_z == this_z:
+            return
+
+        tpos = self.toolhead.get_position()
+        self.toolhead.set_position(
+            [tpos[0], tpos[1], 0.0, tpos[3]], homing_axes=[2]
+        )
+        self.toolhead.manual_move([None, None, self.z_hop], self.lift_speed)
+        kin = self.toolhead.get_kinematics()
+        kin.note_z_not_homed()
+        self.last_z = self.toolhead.get_position()[2]
+
+    #######################################################################
+    # Probe Wrappers
+    #######################################################################
+
+    def multi_probe_begin(self):
+        self.multi = MULTI_FIRST
+
+        # Attach probe before moving to the first probe point and
+        # return to current position. Move because this can be called
+        # before a multi _point_ probe and a multi probe at the same
+        # point but for the latter the toolhead is already in position.
+        # If the toolhead is not returned to the current position it
+        # will complete the probing next to the dock.
+        return_pos = self.toolhead.get_position()
+        self.auto_attach_probe(return_pos)
+
+    def multi_probe_end(self):
+        self.multi = MULTI_OFF
+
+        return_pos = self.toolhead.get_position()
+        # Move away from the bed to ensure the probe isn't triggered,
+        # preventing detaching in the event there's no probe/dock sensor.
+        self.toolhead.manual_move(
+            [None, None, return_pos[2] + 2], self.travel_speed
+        )
+        self.auto_detach_probe(return_pos)
+
+    def probe_prepare(self, hmove):
+        if self.multi == MULTI_OFF or self.multi == MULTI_FIRST:
+            return_pos = self.toolhead.get_position()
+            self.auto_attach_probe(return_pos)
+        if self.multi == MULTI_FIRST:
+            self.multi = MULTI_ON
+
+    def probe_finish(self, hmove):
+        self.wait_trigger_complete.wait()
+        if self.multi == MULTI_OFF:
+            return_pos = self.toolhead.get_position()
+            # Move away from the bed to ensure the probe isn't triggered,
+            # preventing detaching in the event there's no probe/dock sensor.
+            self.toolhead.manual_move(
+                [None, None, return_pos[2] + 2], self.travel_speed
+            )
+            self.auto_detach_probe(return_pos)
+
+    def home_start(
+        self, print_time, sample_time, sample_count, rest_time, triggered=True
+    ):
+        self.finish_home_complete = self.mcu_endstop.home_start(
+            print_time, sample_time, sample_count, rest_time, triggered
+        )
+        r = self.printer.get_reactor()
+        self.wait_trigger_complete = r.register_callback(self.wait_for_trigger)
+        return self.finish_home_complete
+
+    def wait_for_trigger(self, eventtime):
+        self.finish_home_complete.wait()
 
     def get_position_endstop(self):
         return self.position_endstop
 
-    def handle_connect(self):
-        self.toolhead = self.printer.lookup_object('toolhead')
-        pin_params = {
-            'pin': 'z_virtual_endstop',
-            'invert': False,
-            'pullup': False,
-        }
-        self.probe = self.printer.lookup_object('probe').setup_pin('endstop',
-                                                                   pin_params)
-        self.phoming = self.printer.lookup_object('homing')
-
-        # Hook all relevant gcode commands. Saves user having to make macros
-        # for these.
-        if self.hook_commands:
-            self._hook_gcode("PROBE", True)
-            self._hook_gcode("PROBE_CALIBRATE", True)
-            self._hook_gcode("PROBE_ACCURACY", True)
-            self._hook_gcode("BED_MESH_CALIBRATE")
-            self._hook_gcode("SCREWS_TILT_CALCULATE")
-            self._hook_gcode("BED_TILT_CALIBRATE")
-            self._hook_gcode("Z_TILT_ADJUST")
-
-    def _build_config(self):
-        kin = self.printer.lookup_object('toolhead').get_kinematics()
-        for stepper in kin.get_steppers():
-            if stepper.is_active_axis('z'):
-                self.mcu_endstop.add_stepper(stepper)
-
-    def _hook_gcode(self, cmd, restore_pos=False):
-        desc = self.gcode.gcode_help.get(cmd)
-        prev = self.gcode.register_command(cmd, None)
-        if prev is None:
-            return
-        def handler(gcmd):
-            attached = False
-            pos = None
-            if self._attach_state(may_hop=True) != "attached":
-                attached = True
-                self._check_homed_xz()
-                if restore_pos:
-                    pos = self.toolhead.get_position()
-                self._do_z_hop(self.z_hop)
-                self._do_attach()
-                if restore_pos:
-                    self.toolhead.move(pos, self.xy_speed)
-            prev(gcmd)
-            if attached and not self.locked:
-                self._do_z_hop(self.z_hop)
-                self._do_detach()
-                if restore_pos:
-                    self.toolhead.move(pos, self.xy_speed)
-        self.gcode.register_command(cmd, handler, desc=desc)
-
-    cmd_G28_help = "Homes the printer"
-    def cmd_G28(self, gcmd):
-        # Check which axes we want, all if none given
-        want_x, want_y, want_z = [gcmd.get(axis, None) is not None
-                for axis in "XYZ"]
-        if not want_x and not want_y and not want_z:
-            want_x = want_y = want_z = True
-
-        if not (want_x or want_y or want_z):
-            # No axes wanted, ignore this
-            return
-
-        self._do_z_hop(self.z_hop)
-
-        # Home X and Y first
-        if want_x or want_y:
-            hcmd = self.gcode.create_gcode_command("G28", "G28",
-                                                   {'X': want_x, 'Y': want_y})
-            self.phoming.cmd_G28(hcmd)
-
-        if want_z:
-            self._check_homed_xz()
-            attached = False
-            if self._attach_state(after_hop=True) != "attached":
-                attached = True
-                self._do_attach()
-            # Do the actual Z homing with the probe now attached
-            self.toolhead.manual_move([self.home_x_pos, self.home_y_pos],
-                                      self.xy_speed)
-            hcmd = self.gcode.create_gcode_command("G28", "G28", {'Z': '0'})
-            self.phoming.cmd_G28(hcmd)
-            self._do_z_hop(self.z_hop)
-
-            if gcmd.get("LOCK_PROBE", None) is not None:
-                self.locked = True
-            elif attached and not self.locked:
-                self._do_detach()
-
-    cmd_PROBE_ATTACH_help = "Attaches the dockable probe to the toolhead"
-    def cmd_PROBE_ATTACH(self, gcmd):
-        if self._attach_state(may_hop=True) == "attached":
-            return
-
-        self._check_homed_xz()
-        self._do_z_hop(self.z_hop)
-        self._do_attach()
-
-        if gcmd.get("LOCK", None) is not None:
-            self.locked = True
-
-    cmd_PROBE_DETACH_help = "Detaches the dockable probe to the toolhead"
-    def cmd_PROBE_DETACH(self, gcmd):
-        if self.locked and gcmd.get("FORCE", None) is None:
-            return
-        if self._attach_state(may_hop=True) == "detached":
-            return
-
-        self._check_homed_xz()
-        self._do_z_hop(self.z_hop)
-        self._do_detach()
-        self.locked = False
-
-    cmd_PROBE_LOCK_help = "Locks the probe, preventing any detaching operations"
-    def cmd_PROBE_LOCK(self, gcmd):
-        self.locked = True
-
-    cmd_PROBE_UNLOCK_help = "Unlocks the probe, allowing detaching operations"
-    def cmd_PROBE_UNLOCK(self, gcmd):
-        self.locked = False
-
-    cmd_PROBE_STATE_help = "Queries the docking state of the probe"
-    def cmd_PROBE_STATE(self, gcmd):
-        refresh = gcmd.get("REFRESH", None) is not None
-        state = self._attach_state(may_hop=refresh)
-        self.gcode.respond_info("Probe state is %s" % (state,))
-
-    # Perform attaching operation, assuming we already Z hopped and XY homed
-    def _do_attach(self):
-        self._dock_plane(0)
-        self._endstop_descend()
-        self._dock_plane(self.park_dx) # Move out of dock
-        self._do_z_hop(self.z_hop)
-        self.toolhead.wait_moves()
-        if self._is_probe_triggered():
-            self.printer.invoke_shutdown("Probe was still triggered after "
-                                         "attaching")
-        self.toolhead.wait_moves()
-
-    # Perform detaching operation, assuming we already Z hopped and XY homed
-    def _do_detach(self):
-        self._dock_plane(self.park_dx)
-        self._endstop_descend()
-        self._dock_plane(self.detach_dx) # Move across the dock
-        self._do_z_hop(self.z_hop)
-        self.toolhead.wait_moves()
-        if not self._is_probe_triggered():
-            self.printer.invoke_shutdown("Probe wasn't triggered after "
-                                         "detaching")
-
-    # Moves to a location relative to the docking X coordinate
-    def _dock_plane(self, offset=0):
-        kin_status = self.toolhead.get_kinematics().get_status(self._get_time())
-        ymin = kin_status['axis_minimum'][1]
-        self.toolhead.manual_move([self.dock_x+offset,ymin+1], self.xy_speed)
-
-    # Descend on Z until the docking endstop is triggered
-    def _endstop_descend(self):
-        self.toolhead.get_last_move_time() # Synchronizes move time
-        pos = self.toolhead.get_position()
-        hmove = HomingMove(self.printer, [(self.mcu_endstop, "dock")])
-        kin_status = self.toolhead.get_kinematics().get_status(self._get_time())
-        pos[2] = kin_status['axis_minimum'][2]
-        if self._is_homed('z'):
-            hmove.homing_move(pos, self.z_speed, probe_pos=True)
-        else:
-            fakepos = self.toolhead.get_position()
-            fakepos[2] = kin_status['axis_maximum'][2]
-            self.toolhead.set_position(fakepos, homing_axes=(2,))
-            hmove.homing_move(pos, self.z_speed)
-
-    def _attach_state(self, after_hop=False, may_hop=False):
-        if self._is_probe_triggered():
-            # Triggered means we are either touching the plate or the probe
-            # is not attached. To figure out which it is, we need to move
-            # the toolhead up a little bit. If we already did a hop, no
-            # need to do another of course!
-            if not after_hop:
-                if not may_hop:
-                    msg = ("Can't determine state of docked probe without"
-                          " moving toolhead")
-                    raise self.printer.command_error(msg)
-                self._do_z_hop(-self.attachment_check_hop)
-
-            # Read state of probe again
-            if self._is_probe_triggered():
-                # Probe was still triggered, so we are detached
-                return "detached"
-            else:
-                # Probe isn't triggered anymore, so it was touching bed
-                return "attached"
-        else:
-            # Probe isn't triggered which means it must be attached and
-            # not currently pressed
-            return "attached"
-
-    def _is_probe_triggered(self):
-        self.toolhead.wait_moves()
-        move_time = self.toolhead.get_last_move_time()
-        return self.probe.query_endstop(move_time)
-
-    def _get_time(self):
-        return self.printer.get_reactor().monotonic()
-
-    def _is_homed(self, axis):
-        toolhead = self.toolhead
-        status = toolhead.get_kinematics().get_status(self._get_time())
-        return axis in status['homed_axes']
-
-    def _check_homed_xz(self, gcmd=None):
-        if not self._is_homed('x') or not self._is_homed('y'):
-            raise self.printer.command_error("Must home X and Y axes first")
-    
-    def _do_z_hop(self, amount):
-        toolhead = self.toolhead
-        pos = toolhead.get_position()
-        if self._is_homed('z'):
-            if amount < 0:
-                amount = pos[2] - amount # Negative amount means relative
-            toolhead.manual_move([None, None, amount], self.z_speed)
-        else:
-            toolhead.set_position(pos, homing_axes=[2])
-            toolhead.manual_move([None, None, pos[2]+abs(amount)], self.z_speed)
-            toolhead.get_kinematics().note_z_not_homed()
 
 def load_config(config):
-    return DockableProbe(config)
+    msp = DockableProbe(config)
+    config.get_printer().add_object("probe", probe.PrinterProbe(config, msp))
+    return msp
