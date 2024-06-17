@@ -1,12 +1,14 @@
 # Support for probes that dock on the XZ plane, like on bedslingers
 #
-# Copyright (C) 2022  Lasse Dalegaard <dalegaard@gmail.com>
+# Copyright (C) 2024  Lasse Dalegaard <dalegaard@gmail.com>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 #
 # Place in `klippy/extras/` folder as `xz_dockable_probe.py`, then add
 # the following line to your `.git/info/exclude` file:
 # klippy/extras/xz_dockable_probe.py
+#
+# V1.01 - patching breaking change introduced in mainline Klipper PR#6605 @lhndo
 
 import logging
 from .homing import HomingMove
@@ -69,7 +71,7 @@ class DockableProbe:
             'invert': False,
             'pullup': False,
         }
-        self.probe = self.printer.lookup_object('probe').setup_pin('endstop',
+        self.probe = self.printer.lookup_object('probe').probe_session.homing_helper.setup_pin('endstop',
                                                                    pin_params)
         self.phoming = self.printer.lookup_object('homing')
 
