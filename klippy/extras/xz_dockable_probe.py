@@ -289,7 +289,7 @@ class DockableProbe:
         else:
             toolhead.set_position(pos, homing_axes=[2])
             toolhead.manual_move([None, None, pos[2]+abs(amount)], self.z_speed)
-            toolhead.get_kinematics().clear_homing_state(2)
+            toolhead.get_kinematics().clear_homing_state([2])
 
 def load_config(config):
     return DockableProbe(config)
