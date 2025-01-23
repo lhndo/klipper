@@ -234,7 +234,7 @@ class DockableProbe:
         else:
             fakepos = self.toolhead.get_position()
             fakepos[2] = kin_status['axis_maximum'][2]
-            self.toolhead.set_position(fakepos, homing_axes=(2,))
+            self.toolhead.set_position(fakepos, homing_axes="z")
             hmove.homing_move(pos, self.z_speed)
 
     def _attach_state(self, after_hop=False, may_hop=False):
@@ -287,9 +287,9 @@ class DockableProbe:
                 amount = pos[2] - amount # Negative amount means relative
             toolhead.manual_move([None, None, amount], self.z_speed)
         else:
-            toolhead.set_position(pos, homing_axes=[2])
+            toolhead.set_position(pos, homing_axes="z")
             toolhead.manual_move([None, None, pos[2]+abs(amount)], self.z_speed)
-            toolhead.get_kinematics().clear_homing_state([2])
+            toolhead.get_kinematics().clear_homing_state("z")
 
 def load_config(config):
     return DockableProbe(config)
