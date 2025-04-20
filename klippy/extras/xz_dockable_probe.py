@@ -73,7 +73,7 @@ class DockableProbe:
             'invert': False,
             'pullup': False,
         }
-        self.probe = self.printer.lookup_object('probe').probe_session.homing_helper.setup_pin('endstop',
+        self.probe = self.printer.lookup_object('probe').homing_helper.setup_pin('endstop',
                                                                    pin_params)
         self.phoming = self.printer.lookup_object('homing')
 
