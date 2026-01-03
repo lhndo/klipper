@@ -34,7 +34,7 @@ typedef unsigned int neopixel_time_t;
 static __always_inline neopixel_time_t
 nsecs_to_ticks(uint32_t ns)
 {
-    return timer_from_us(ns * 1000) / 1000000;
+    return DIV_ROUND_UP(timer_from_us(ns * 1000), 1000000);
 }
 
 static inline int
@@ -75,7 +75,7 @@ neopixel_delay(neopixel_time_t start, neopixel_time_t ticks)
 #endif
 
 // Minimum amount of time for a '1 bit' to be reliably detected
-#define PULSE_LONG_TICKS  nsecs_to_ticks(650)
+#define PULSE_LONG_TICKS  nsecs_to_ticks(800)
 // Minimum amount of time for any level change to be reliably detected
 #define EDGE_MIN_TICKS    nsecs_to_ticks(200)
 // Minimum average time needed to transmit each bit (two level changes)

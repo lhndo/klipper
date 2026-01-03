@@ -46,7 +46,7 @@ def calc_crc7(data, with_padding=True):
         crc ^= b & 0xFF
         for i in range(8):
             crc = (crc << 1) ^ poly if crc & 0x80 else crc << 1
-    # The sdcard protocol likes the crc left justfied with a
+    # The sdcard protocol likes the crc left justified with a
     # padded bit
     if not with_padding:
         return crc
@@ -380,7 +380,7 @@ class FatFS:
             (fdate >> 5) & 0xF, fdate & 0x1F, ((fdate >> 9) & 0x7F) + 1980,
             (ftime >> 11) & 0x1F, (ftime >> 5) & 0x3F, ftime & 0x1F)
         return {
-            'name': self.ffi_main.string(finfo.name, 13),
+            'name': self.ffi_main.string(finfo.name, 256),
             'size': finfo.size,
             'modified': dstr,
             'is_dir': bool(finfo.attrs & 0x10),
@@ -566,7 +566,7 @@ class SDCardSPI:
             # At this time MMC is not supported
             if len(resp) == 5:
                 if self.sd_version == 1 and resp[0] == 1:
-                    # Check acceptable volatage range for V1 cards
+                    # Check acceptable voltage range for V1 cards
                     if resp[2] != 0xFF:
                         raise OSError("flash_sdcard: card does not support"
                                       " 3.3v range")
@@ -903,7 +903,7 @@ class SDCardSDIO:
                                   " out of IDLE after reset")
             if len(resp) == 4:
                 if self.sd_version == 1:
-                    # Check acceptable volatage range for V1 cards
+                    # Check acceptable voltage range for V1 cards
                     if resp[1] != 0xFF:
                         raise OSError("flash_sdcard: card does not support"
                                       " 3.3v range")
@@ -1302,7 +1302,9 @@ class MCUConnection:
         else:
             if bus not in bus_enums:
                 raise SPIFlashError("Invalid SPI Bus: %s" % (bus,))
-            bus_cmds = SPI_BUS_CMD % (SPI_OID, bus, SPI_MODE, SD_SPI_SPEED)
+            bus_cmds = [
+                SPI_BUS_CMD % (SPI_OID, bus, SPI_MODE, SD_SPI_SPEED),
+            ]
         if cs_pin not in pin_enums:
             raise SPIFlashError("Invalid CS Pin: %s" % (cs_pin,))
         cfg_cmds = [ALLOC_OIDS_CMD % (1,),]
@@ -1313,7 +1315,6 @@ class MCUConnection:
         ]
         cfg_cmds.append(self._try_send_command(spi_cfg_cmds))
         cfg_cmds.append(self._try_send_command(bus_cmds))
-        self._try_send_command(cfg_cmds)
         config_crc = zlib.crc32('\n'.join(cfg_cmds).encode()) & 0xffffffff
         self._serial.send(FINALIZE_CFG_CMD % (config_crc,))
         config = self.get_mcu_config()
@@ -1379,7 +1380,32 @@ class MCUConnection:
         input_sha = hashlib.sha1()
         sd_sha = hashlib.sha1()
         klipper_bin_path = self.board_config['klipper_bin_path']
+        add_ts = self.board_config.get('requires_unique_fw_name', False)
         fw_path = self.board_config.get('firmware_path', "firmware.bin")
+        if add_ts:
+            fw_dir = os.path.dirname(fw_path)
+            fw_name, fw_ext = os.path.splitext(os.path.basename(fw_path))
+            ts = time.strftime("%Y%m%d%H%M%S")
+            fw_name_ts = f"{ts}{fw_name}{fw_ext}"
+            if fw_dir:
+                fw_path = os.path.join(fw_dir, fw_name_ts)
+            else:
+                fw_path = fw_name_ts
+            list_dir = fw_dir if fw_dir else ""
+            try:
+                output_line("\nSD Card FW Directory Contents:")
+                for f in self.fatfs.list_sd_directory(list_dir):
+                    fname = f['name'].decode('utf-8')
+                    if fname.endswith(fw_ext):
+                        self.fatfs.remove_item(
+                            os.path.join(list_dir, fname)
+                        )
+                        output_line(
+                            "Old firmware file %s found and deleted"
+                            % (fname,)
+                        )
+            except Exception:
+                logging.exception("Error cleaning old firmware files")
         try:
             with open(klipper_bin_path, 'rb') as local_f:
                 with self.fatfs.open_file(fw_path, "wb") as sd_f:
@@ -1642,7 +1668,7 @@ def main():
     logging.basicConfig(level=log_level)
     flash_args = board_defs.lookup_board(args.board)
     if flash_args is None:
-        output_line("Unable to find defintion for board: %s" % (args.board,))
+        output_line("Unable to find definition for board: %s" % (args.board,))
         sys.exit(-1)
     flash_args['device'] = args.device
     flash_args['baud'] = args.baud
